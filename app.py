@@ -5,26 +5,44 @@ import streamlit as st
 st.set_page_config(page_title="Sales Report Builder", layout="wide")
 
 OUTPUT_COLUMNS = [
-    "shipping date",
+    "Shipping Date",
     "Reference Number",
-    "Order date",
+    "Order Date",
     "Consignee City",
     "Consignee Phone",
     "Carrier WayBill",
     "Salesman",
     "Order Value",
-    "date",
-    "status",
+    "Date",
+    "Status",
     "Clarify",
     "Notes",
-    "Orders (first-time)",
-    "Orders (returning)",
+    "New Customer Orders",
+    "Returning Customer Orders",
 ]
 
-UAE_OMAN_COUNTRIES = {"united arab emirates", "uae", "oman"}
+UAE_OMAN_CODES = {"uae", "om"}
+
+COUNTRY_CODE_MAP = {
+    "united arab emirates": "UAE",
+    "uae": "UAE",
+    "oman": "OM",
+    "om": "OM",
+    "saudi arabia": "SA",
+    "sa": "SA",
+    "kuwait": "KW",
+    "kw": "KW",
+    "qatar": "QA",
+    "qa": "QA",
+}
 
 EXCLUDED_SALES_CHANNEL = "point of sale"
 REQUIRED_FULFILLMENT_STATUS = "fulfilled"
+
+
+def to_country_code(series):
+    normalized = series.astype(str).str.strip().str.lower()
+    return normalized.map(COUNTRY_CODE_MAP).fillna(series)
 
 
 def read_any(file):
@@ -97,30 +115,40 @@ def build_report_rows(df):
     staff = staff_raw.astype(str).str.strip()
     is_missing = staff_raw.isna() | staff.isin(["", "nan", "None", "<NA>"])
     staff = staff.where(~is_missing, "created by order")
+    staff = staff.str.title()
+
+    order_date = df["Day"]
+    if pd.api.types.is_datetime64_any_dtype(order_date):
+        order_date = order_date.dt.date
 
     out = pd.DataFrame()
-    out["shipping date"] = pd.NA
+    out["Shipping Date"] = pd.NA
     out["Reference Number"] = df["Order name"]
-    out["Order date"] = df["Day"]
-    out["Consignee City"] = df["Shipping country"]
+    out["Order Date"] = order_date
+    out["Consignee City"] = to_country_code(df["Shipping country"])
     out["Consignee Phone"] = pd.NA
     out["Carrier WayBill"] = pd.NA
     out["Salesman"] = staff
     out["Order Value"] = df["Total sales"]
-    out["date"] = pd.NA
-    out["status"] = pd.NA
+    out["Date"] = pd.NA
+    out["Status"] = pd.NA
     out["Clarify"] = pd.NA
     out["Notes"] = pd.NA
-    out["Orders (first-time)"] = df["Orders (first-time)"]
-    out["Orders (returning)"] = df["Orders (returning)"]
+    out["New Customer Orders"] = df["Orders (first-time)"]
+    out["Returning Customer Orders"] = df["Orders (returning)"]
     return out[OUTPUT_COLUMNS]
 
 
 def split_by_region(df):
     country_norm = df["Consignee City"].astype(str).str.strip().str.lower()
-    uae_oman = df[country_norm.isin(UAE_OMAN_COUNTRIES)].copy()
-    rest_of_gulf = df[~country_norm.isin(UAE_OMAN_COUNTRIES) & country_norm.ne("nan") & country_norm.ne("")].copy()
+    uae_oman = df[country_norm.isin(UAE_OMAN_CODES)].copy()
+    rest_of_gulf = df[~country_norm.isin(UAE_OMAN_CODES) & country_norm.ne("nan") & country_norm.ne("")].copy()
     return uae_oman, rest_of_gulf
+
+
+def style_header(worksheet):
+    for cell in worksheet[1]:
+        cell.font = cell.font.copy(bold=True)
 
 
 def to_excel_bytes(uae_oman, rest_of_gulf):
@@ -128,6 +156,8 @@ def to_excel_bytes(uae_oman, rest_of_gulf):
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         uae_oman.to_excel(writer, sheet_name="UAE & Oman", index=False)
         rest_of_gulf.to_excel(writer, sheet_name="Rest of Gulf", index=False)
+        style_header(writer.sheets["UAE & Oman"])
+        style_header(writer.sheets["Rest of Gulf"])
     buffer.seek(0)
     return buffer
 
