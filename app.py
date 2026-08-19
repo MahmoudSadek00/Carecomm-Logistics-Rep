@@ -114,8 +114,8 @@ def build_report_rows(df):
     staff_raw = df["Staff member name"]
     staff = staff_raw.astype(str).str.strip()
     is_missing = staff_raw.isna() | staff.isin(["", "nan", "None", "<NA>"])
-    staff = staff.where(~is_missing, "created by order")
     staff = staff.str.title()
+    staff = staff.where(~is_missing, "Created by customer")
 
     order_date = df["Day"]
     if pd.api.types.is_datetime64_any_dtype(order_date):
@@ -151,13 +151,29 @@ def style_header(worksheet):
         cell.font = cell.font.copy(bold=True)
 
 
+def autofit_columns(worksheet, dataframe, min_width=8, max_width=45, padding=2):
+    for i, column in enumerate(dataframe.columns, start=1):
+        header_len = len(str(column))
+        if len(dataframe) > 0:
+            lengths = dataframe[column].apply(lambda v: 0 if pd.isna(v) else len(str(v)))
+            value_len = lengths.max()
+        else:
+            value_len = 0
+        width = max(header_len, value_len) + padding
+        width = max(min_width, min(max_width, width))
+        letter = worksheet.cell(row=1, column=i).column_letter
+        worksheet.column_dimensions[letter].width = width
+
+
 def to_excel_bytes(uae_oman, rest_of_gulf):
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         uae_oman.to_excel(writer, sheet_name="UAE & Oman", index=False)
         rest_of_gulf.to_excel(writer, sheet_name="Rest of Gulf", index=False)
-        style_header(writer.sheets["UAE & Oman"])
-        style_header(writer.sheets["Rest of Gulf"])
+        for sheet_name, frame in (("UAE & Oman", uae_oman), ("Rest of Gulf", rest_of_gulf)):
+            ws = writer.sheets[sheet_name]
+            style_header(ws)
+            autofit_columns(ws, frame)
     buffer.seek(0)
     return buffer
 
