@@ -148,7 +148,14 @@ if shipping_file is not None:
     st.write(f"{len(shipping_df)} rows loaded.")
     guessed = default_mapping(shipping_df.columns.tolist(), SHIPPING_DEFAULTS)
 
-    shipping_fields = ['ref_number'] + [f for h, f, s in fields if s == 'shipping']
+    # 'ref_number' is always prepended explicitly -- exclude it from the
+    # list-comprehension pass too, or a sheet whose OUTPUT ref_number field
+    # is itself sourced from the shipping file (Iraq: 'ReceiptNumber' comes
+    # from shipping, not Shopify) ends up with it twice, producing two
+    # selectboxes with the same widget key and crashing with
+    # StreamlitDuplicateElementKey. Mirrors the same fix already applied to
+    # shopify_fields above.
+    shipping_fields = ['ref_number'] + [f for h, f, s in fields if s == 'shipping' and f != 'ref_number']
     cols = st.columns(3)
     for i, field in enumerate(shipping_fields):
         with cols[i % 3]:
