@@ -118,7 +118,14 @@ TARGET_SHEETS = {
             ('shipping date', 'blank', 'blank'),
             ('Reference Number', 'ref_number', 'shipping'),
             ('Order date', 'order_date', 'shopify'),
-            ('Consignee City', 'city', 'shipping'),
+            # Despite its name, the raw sheet's 'Consignee City' column
+            # actually holds the COUNTRY code (SA/KW/QA), not a real city --
+            # confirmed by Mahmoud (Aug 2026). Sourced from the shipping
+            # file's own 'Consignee Country' column (which already comes as
+            # exactly 'SA'/'KW'/'QA' in the real export), normalized the same
+            # way as UAE & Oman's country-code city. See 'shipping_country'
+            # in fill_fields() below -- NOT the actual city text.
+            ('Consignee City', 'city', 'shipping_country'),
             ('Consignee Phone', 'phone', 'shipping'),
             ('AWB', 'waybill', 'shipping'),
             ('Salesman', 'salesman', 'shopify'),
@@ -139,15 +146,18 @@ TARGET_SHEETS = {
             ('New Customer Orders', 'new_customer', 'shopify'),
             ('Returning Customer Orders', 'returning_customer', 'shopify'),
         ],
-        # Gulf's city now comes straight from the shipping file (a real city
-        # name, e.g. 'RIYADH', 'جدة') same as Iraq -- no country-code
-        # normalization needed, so no default-for-blank picker either.
-        'country_choices': {},
-        # Shipping-side columns needed by the two custom 'source' branches
-        # above but not tied to any single output field on their own --
-        # forced into the shipping mapping UI in app.py regardless of
-        # whether a 'fields' entry declares them as its source.
-        'extra_shipping_fields': ['cargo_value', 'cod_amount', 'payment_type'],
+        # Gulf's 'Consignee City' output column is actually the country code
+        # (see the 'fields' comment above) -- these are the three the real
+        # shipping export uses (Consignee Country: SA/KW/QA), same shape as
+        # UAE & Oman's country_choices.
+        'country_choices': {'SA': 'Saudi Arabia', 'KW': 'Kuwait', 'QA': 'Qatar'},
+        # Shipping-side columns needed by custom 'source' branches above but
+        # not tied to any single output field on their own -- forced into
+        # the shipping mapping UI in app.py regardless of whether a 'fields'
+        # entry declares them as its source. 'country' feeds Consignee City
+        # (via 'shipping_country' above); cargo_value/cod_amount/payment_type
+        # feed the Order Value/Shipping rules.
+        'extra_shipping_fields': ['country', 'cargo_value', 'cod_amount', 'payment_type'],
         # Gulf's "Sales overview" export has one row per (order, day) across
         # the WHOLE report date range (all zeros except the real event day)
         # -- NOT one row per return/edit event like Monthly POS Report. Without
@@ -204,6 +214,7 @@ FIELD_LABELS = {
     'consignee_name': 'Consignee / recipient name',
     'net_sales': 'Net sales (for the optional Shipping column)',
     'new_or_returning': "New or returning customer (single combined column, Gulf's own Shopify export)",
+    'country': "Consignee Country (SA/KW/QA on the shipping file -- feeds the output 'Consignee City' column, which despite its name holds the country code, not an actual city)",
     'cargo_value': "Cargo Value (goods value on the shipping file -- Gulf's Order Value source for Prepaid orders, and fallback for COD orders)",
     'cod_amount': "COD Amount (cash collected on delivery -- Gulf's primary Order Value source for COD orders; 0 for Prepaid orders by design)",
     'payment_type': 'Payment Type (COD / Prepaid)',
@@ -241,6 +252,7 @@ SHIPPING_DEFAULTS = {
     'consignee_name': ['Recipient Name', 'Consignee Name', 'Customer Name'],
     'city': ['City', 'Consignee City'],
     # Gulf ("Golden Collection" export) only -- see TARGET_SHEETS['gulf'].
+    'country': ['Consignee Country'],
     'cargo_value': ['Cargo Value'],
     'cod_amount': ['COD Amount'],
     'payment_type': ['Payment Type'],
@@ -633,6 +645,23 @@ def merge_sources(
                 # 'gulf_value_full' above). Supersedes the earlier COD-
                 # Amount-minus-Cargo-Value derivation.
                 val = 0
+            elif source == 'shipping_country':
+                # Gulf's output 'Consignee City' column is actually the
+                # COUNTRY code (SA/KW/QA), confirmed by Mahmoud (Aug 2026) --
+                # sourced from the shipping file's own 'Consignee Country'
+                # column (mapped as 'country'), NOT its 'Consignee City'
+                # column (a real city name, not what this output wants).
+                # Reuses the same normalize_city() UAE & Oman already uses
+                # for its country-code city, and the same blank/unrecognized
+                # tracking so those still get flagged and counted.
+                country_col = shipping_map.get('country')
+                raw_country = srow_ship.get(country_col, '') if (srow_ship is not None and country_col) else ''
+                val, was_blank, was_unrec = normalize_city(raw_country, target_key, default_city_for_blank)
+                if was_blank:
+                    blank_city_count += 1
+                if was_unrec:
+                    unrecognized_city_count += 1
+                    issues.append(f"unrecognized shipping country: {raw_country!r}")
             else:  # shipping
                 col = shipping_map.get(field)
                 raw_val = srow_ship.get(col, '') if (srow_ship is not None and col) else ''
