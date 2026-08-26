@@ -58,10 +58,28 @@ if shopify_file is not None:
     st.write(f"{len(shopify_df)} rows loaded.")
     guessed = default_mapping(shopify_df.columns.tolist(), SHOPIFY_DEFAULTS)
 
-    # 'ref_number' is always needed on the Shopify side to group/aggregate an
-    # order's rows, even on a sheet (like Iraq) whose OUTPUT Reference column
-    # is sourced from the shipping file instead.
-    shopify_fields = ['ref_number'] + [f for h, f, s in fields if s == 'shopify' and f != 'ref_number']
+    # 'ref_number' and 'order_value' are always needed on the Shopify side
+    # (to group/aggregate an order's rows, and as the Gulf Order Value
+    # fallback -- see 'shipping_fallback_shopify' in engine.py) even on a
+    # sheet whose OUTPUT field is sourced from elsewhere. Gulf's New/
+    # Returning customer comes as ONE combined column instead of two.
+    combined_new_returning = TARGET_SHEETS[target_key].get('new_returning_combined')
+    other_shopify_fields = [
+        f for h, f, s in fields if s == 'shopify' and f not in ('ref_number', 'order_value')
+        and not (combined_new_returning and f in ('new_customer', 'returning_customer'))
+    ]
+    if combined_new_returning:
+        other_shopify_fields.append('new_or_returning')
+    # Some target sheets need a Shopify-file column that isn't any single
+    # output field's declared source (Gulf's 'Hour' column marks the real
+    # event row in its per-day-pivot export -- see FIELD_LABELS['event_time']
+    # / aggregate_shopify_orders) -- 'extra_shopify_fields' forces those into
+    # the mapping UI too, same mechanism as extra_shipping_fields below.
+    extra_shopify = [
+        f for f in TARGET_SHEETS[target_key].get('extra_shopify_fields', [])
+        if f not in ('ref_number', 'order_value') and f not in other_shopify_fields
+    ]
+    shopify_fields = ['ref_number', 'order_value'] + other_shopify_fields + extra_shopify
     cols = st.columns(3)
     for i, field in enumerate(shopify_fields):
         with cols[i % 3]:
@@ -86,30 +104,44 @@ if shopify_file is not None:
                 format_func=lambda k: f"{k} ({TARGET_SHEETS[target_key]['country_choices'][k]})",
             )
 
-    shipping_fee_box_title = (
-        "Shipping column (Total sales - Net sales, summed per order)" if has_baked_shipping
-        else "Optional: add a Shipping column (Total sales - Net sales, summed per order)"
-    )
-    with st.expander(shipping_fee_box_title, expanded=has_baked_shipping):
+    shipping_fee_source = next((s for h, f, s in fields if f == 'shipping_fee'), None)
+
+    if shipping_fee_source == 'zero':
+        # Gulf (v2, Aug 2026): Shipping is no longer broken out at all --
+        # always written as 0, with the full order amount folded into Value
+        # instead (COD Amount for COD orders, Cargo Value for Prepaid,
+        # mapped in step 3 below). No Net sales involved, nothing to map here.
         st.caption(
-            "Every 'item added later' row seen in this format has Total sales == Net sales, so this "
-            "stays correctly anchored to the original order's shipping charge even when an order has "
-            "more than one row. See the README for the worked example."
+            "Shipping for this sheet is not broken out -- always written as 0. Order Value carries the "
+            "FULL amount instead: COD Amount for COD orders, Cargo Value for Prepaid (mapped in step 3 "
+            "below). TEMPORARY rule pending a better long-term source."
         )
-        options = ['(none)'] + shopify_df.columns.tolist()
-        net_guess = ['Net sales'] if 'Net sales' in shopify_df.columns else []
-        net_choice = st.selectbox(
-            FIELD_LABELS['net_sales'], options, index=options.index(net_guess[0]) if net_guess else 0,
+        include_shipping_fee = True
+    else:
+        shipping_fee_box_title = (
+            "Shipping column (Total sales - Net sales, summed per order)" if has_baked_shipping
+            else "Optional: add a Shipping column (Total sales - Net sales, summed per order)"
         )
-        shopify_map['net_sales'] = None if net_choice == '(none)' else net_choice
-        if has_baked_shipping:
-            include_shipping_fee = True
-            if not shopify_map['net_sales']:
-                st.warning("This sheet's Shipping column needs a Net sales mapping, or it will be left blank.")
-        else:
-            include_shipping_fee = st.checkbox(
-                "Add the Shipping column to the download", value=False, disabled=not shopify_map['net_sales'],
+        with st.expander(shipping_fee_box_title, expanded=has_baked_shipping):
+            st.caption(
+                "Every 'item added later' row seen in this format has Total sales == Net sales, so this "
+                "stays correctly anchored to the original order's shipping charge even when an order has "
+                "more than one row. See the README for the worked example."
             )
+            options = ['(none)'] + shopify_df.columns.tolist()
+            net_guess = ['Net sales'] if 'Net sales' in shopify_df.columns else []
+            net_choice = st.selectbox(
+                FIELD_LABELS['net_sales'], options, index=options.index(net_guess[0]) if net_guess else 0,
+            )
+            shopify_map['net_sales'] = None if net_choice == '(none)' else net_choice
+            if has_baked_shipping:
+                include_shipping_fee = True
+                if not shopify_map['net_sales']:
+                    st.warning("This sheet's Shipping column needs a Net sales mapping, or it will be left blank.")
+            else:
+                include_shipping_fee = st.checkbox(
+                    "Add the Shipping column to the download", value=False, disabled=not shopify_map['net_sales'],
+                )
 
     with st.expander("Filters (optional columns on the Shopify file)"):
         cancel_options = ['(none)'] + shopify_df.columns.tolist()
@@ -155,7 +187,14 @@ if shipping_file is not None:
     # selectboxes with the same widget key and crashing with
     # StreamlitDuplicateElementKey. Mirrors the same fix already applied to
     # shopify_fields above.
-    shipping_fields = ['ref_number'] + [f for h, f, s in fields if s == 'shipping' and f != 'ref_number']
+    # Some target sheets need a shipping-file column that isn't any single
+    # output field's declared source (Gulf's Cargo Value/COD Amount/Payment
+    # Type feed the Order Value fallback + Shipping computation instead) --
+    # 'extra_shipping_fields' forces those into the mapping UI too.
+    extra_fields = [f for f in TARGET_SHEETS[target_key].get('extra_shipping_fields', []) if f != 'ref_number']
+    shipping_fields = ['ref_number'] + [
+        f for h, f, s in fields if s == 'shipping' and f != 'ref_number' and f not in extra_fields
+    ] + extra_fields
     cols = st.columns(3)
     for i, field in enumerate(shipping_fields):
         with cols[i % 3]:
@@ -223,7 +262,14 @@ if st.button("Merge files", disabled=not ready, type="primary"):
     preview_fields = list(fields)
     if include_shipping_fee and not has_baked_shipping:
         preview_fields = preview_fields + [('Shipping', 'shipping_fee', 'computed')]
-    preview_cols = [h for h, f, s in preview_fields]
+    # Gulf's real sheet has TWO unnamed blank columns -- selecting a plain
+    # pandas DataFrame by a column-name list with '' twice produces an
+    # actual duplicate-labeled DataFrame, which st.dataframe's pyarrow
+    # conversion rejects outright ("Duplicate column names found"), crashing
+    # the app. Both blank columns are always empty anyway, so the on-screen
+    # preview only needs to show each column name once -- the real download
+    # (workbook_to_bytes) still writes both, matching the sheet exactly.
+    preview_cols = list(dict.fromkeys(h for h, f, s in preview_fields))
     st.dataframe(merged[[c for c in preview_cols if c in merged.columns]], use_container_width=True)
 
     xlsx_bytes = workbook_to_bytes(merged, target_key, include_shipping_fee=include_shipping_fee)
