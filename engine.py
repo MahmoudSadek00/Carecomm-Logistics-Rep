@@ -71,7 +71,12 @@ TARGET_SHEETS = {
     'uae_om': {
         'label': 'UAE & Oman',
         'ref_prefix': True,
-        'join_base': 'shopify',
+        # Switched to shipping-first (Aug 2026, per Mahmoud) -- same as Gulf
+        # and Iraq now: an order only shows up once it's actually with the
+        # shipping company, not the moment it's placed in Shopify. All three
+        # groups are joined the same way now; UAE & Oman used to be the one
+        # exception (Shopify-first, still in git history if ever needed).
+        'join_base': 'shipping',
         # Full raw-sheet layout (confirmed against sheet_templates.xlsx's own
         # header row, Aug 2026): 'shipping date' / 'date' / the unnamed
         # column / 'Notes' / 'Analysis' are the real sheet's own blank
@@ -80,7 +85,7 @@ TARGET_SHEETS = {
         # Mahmoud's spec), same derivation as Iraq: Total sales - Net sales.
         'fields': [
             ('shipping date', 'blank', 'blank'),
-            ('Reference Number', 'ref_number', 'shopify'),
+            ('Reference Number', 'ref_number', 'shipping'),
             ('Order date', 'order_date', 'shopify'),
             ('Consignee City', 'city', 'shopify'),
             ('Consignee Phone', 'phone', 'shipping'),
@@ -170,11 +175,11 @@ TARGET_SHEETS = {
     'iraq': {
         'label': 'Iraq',
         'ref_prefix': False,
-        # Iraq is JOINED THE OTHER WAY ROUND from UAE/Gulf: the shipping file
-        # is the base/driving table and Shopify data is looked up onto it
-        # (per Mahmoud, Aug 2026) -- an order isn't logged in the Iraq sheet
-        # until it's actually with the shipping company, unlike UAE/Gulf
-        # where every Shopify order shows up (Pending) even before shipping.
+        # All three groups are now joined this way (Aug 2026, per Mahmoud):
+        # the shipping file is the base/driving table and Shopify data is
+        # looked up onto it -- an order isn't logged in a raw sheet until
+        # it's actually with the shipping company, so it doesn't belong in
+        # the download yet either.
         'join_base': 'shipping',
         # Full raw-sheet column layout, in the sheet's own order. date ship /
         # status / Notes / Analysis are left blank on purpose -- delivery
@@ -503,12 +508,12 @@ def merge_sources(
     include_shipping_fee=False,
 ):
     """Returns (merged_df, warnings, stats). One row per order, joined either
-    Shopify-driven (UAE/Gulf: every Shopify order shows up, shipping data
-    filled in where matched) or shipping-driven (Iraq, per Mahmoud Aug 2026:
-    only orders already with the shipping company show up, Shopify data
-    filled in where matched) -- see TARGET_SHEETS[target_key]['join_base'].
-    QA columns '_matched' / '_issues' are for the in-app preview only,
-    dropped before the final download."""
+    Shopify-driven (every Shopify order shows up, shipping data filled in
+    where matched) or shipping-driven (per Mahmoud, Aug 2026: only orders
+    already with the shipping company show up, Shopify data filled in where
+    matched -- now all three groups, UAE & Oman, Gulf, and Iraq) -- see
+    TARGET_SHEETS[target_key]['join_base']. QA columns '_matched' / '_issues'
+    are for the in-app preview only, dropped before the final download."""
     warnings = []
     fields = list(TARGET_SHEETS[target_key]['fields'])
     ref_prefix = TARGET_SHEETS[target_key]['ref_prefix']
@@ -700,7 +705,7 @@ def merge_sources(
             f'{unmatched_other} shipping-company row(s) had no matching Shopify order -- check for a '
             f'reference-number mismatch, or these may be manual/offline orders not tracked in Shopify.'
         )
-    else:  # join_base == 'shipping' (Iraq)
+    else:  # join_base == 'shipping' (all three groups now, Aug 2026)
         seen_keys = []
         for key, idxs in ship_index.items():
             seen_keys.append(key)
