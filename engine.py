@@ -83,6 +83,18 @@ TARGET_SHEETS = {
         # columns -- delivery outcome isn't known yet at this stage, same as
         # Iraq. 'Shipping' is baked in right after 'Order Value' (per
         # Mahmoud's spec), same derivation as Iraq: Total sales - Net sales.
+        # Primary Shopify source is the "Monthly POS Report" export, same as
+        # Iraq. As of Sep 2026 (per Mahmoud), an OPTIONAL second upload --
+        # Shopify's own native "Export orders" file -- can also be supplied
+        # (all three groups, see app.py section 2b and merge_sources()'s
+        # export_orders_df/export_orders_map): wherever an order is found in
+        # that file, its Subtotal/Shipping/Created at OVERRIDE the Monthly
+        # POS Report-derived Order Value/Shipping/Order date for that order
+        # (more accurate -- real fields, not VAT/Total-minus-Net derivations
+        # -- see the README's "Export Orders override" section). Orders with
+        # no Export orders match keep the Monthly POS Report-derived values
+        # exactly as before -- this is a pure upgrade when the file is
+        # uploaded, never a requirement.
         'fields': [
             ('shipping date', 'blank', 'blank'),
             ('Reference Number', 'ref_number', 'shipping'),
@@ -217,6 +229,7 @@ FIELD_LABELS = {
     'waybill': 'Carrier waybill / AWB',
     'salesman': 'Staff / salesman name',
     'order_value': 'Order value -- goods only, Net sales (summed across an order\'s rows); Total sales used only if no Net sales column is mapped',
+    'shipping_fee': "Shipping fee (Export Orders' own 'Shipping' column -- overrides the Monthly POS Report-derived Shipping wherever this order is found)",
     'new_customer': 'New-customer flag',
     'returning_customer': 'Returning-customer flag',
     'consignee_name': 'Consignee / recipient name',
@@ -250,6 +263,33 @@ SHOPIFY_DEFAULTS = {
     'event_time': ['Hour'],
 }
 
+# Shopify's own native "Export orders" file (Orders page -> Export). One row
+# per LINE ITEM -- order-level fields (Subtotal/Shipping/Taxes/Total/Created
+# at/Employee/...) are populated only on each order's FIRST row in the file,
+# blank on every following line-item row for that same order -- Employee is
+# genuine order-level data (who took/placed the order), not a per-line-item
+# attribute; it's just physically written on that same first row alongside
+# Subtotal/Shipping/Created at (Sep 2026, corrected by Mahmoud -- an earlier
+# version of this tool treated it as unreliable at the order level and never
+# overrode Salesman with it; that was wrong). See
+# aggregate_shopify_export_orders(). Confirmed against a real sample (Sep
+# 2026, UAE & Oman). OPTIONAL, all three groups (Sep 2026, per Mahmoud) --
+# see merge_sources()'s export_orders_df/export_orders_map: wherever an order
+# is found here, its Subtotal/Shipping/Created at/Employee OVERRIDE the
+# primary Monthly POS Report/Sales overview file's derived Order Value/
+# Shipping/Order date/Salesman for that order. City and New/Returning
+# Customer still always come from the primary file, never from here --
+# Export orders has no New/Returning Customer column at all, and City here
+# is a 2-letter shipping-country code, not the richer value the primary file
+# already provides.
+EXPORT_ORDERS_DEFAULTS = {
+    'ref_number': ['Name'],
+    'order_date': ['Created at'],
+    'order_value': ['Subtotal'],
+    'shipping_fee': ['Shipping'],
+    'salesman': ['Employee'],
+}
+
 # Union of both real shipping-carrier formats seen so far (Gulf "Golden
 # Collection" + Iraq's own export) -- guess_column only matches candidates
 # that are actually present in the uploaded file, so listing both is safe.
@@ -274,7 +314,7 @@ SHIPPING_DEFAULTS = {
 # here at all -- see TARGET_SHEETS['iraq'].)
 COUNTRY_NORMALIZE = {
     'uae_om': {
-        'united arab emirates': 'UAE', 'uae': 'UAE',
+        'united arab emirates': 'UAE', 'uae': 'UAE', 'ae': 'UAE',
         'oman': 'OM', 'om': 'OM',
     },
     'gulf': {
@@ -513,6 +553,111 @@ def aggregate_shopify_orders(
     return pd.DataFrame(rows), stats
 
 
+def aggregate_shopify_export_orders(
+    export_df, export_map,
+    exclude_canceled=True, canceled_col=None,
+    allowed_fulfillment_statuses=None, fulfillment_col=None,
+):
+    """Collapse Shopify's own native "Export orders" file (Orders page ->
+    Export -- one row per LINE ITEM; order-level fields like Subtotal/
+    Shipping/Total/Financial Status/Created at are populated only on each
+    order's FIRST row in the file, blank on every following line-item row
+    for that same order) into one row per order.
+
+    Order-level fields are read straight off that first row (grp.iloc[0] --
+    reliable because Shopify always puts them there, confirmed against a
+    real sample, Sep 2026), NOT summed/derived like aggregate_shopify_orders()
+    does for the Monthly POS Report shape -- there's nothing to sum, a given
+    order's Subtotal/Shipping/Total already reflect its final, current state
+    in a single field each.
+
+    Order Value = Subtotal directly (goods only, tax-inclusive -- no VAT
+    reconstruction needed, unlike Monthly POS Report's Net sales). Shipping =
+    the file's own Shipping column directly. Order date = Created at (the
+    order's real placement date -- not a later financial-event date, so
+    there's no "earliest row might be wrong" ambiguity here at all; see the
+    README's "Order date can come out wrong" section, moot for this format).
+
+    This format has no New/Returning Customer column at all -- callers that
+    need it join a separate Monthly POS Report upload by Reference Number
+    (see merge_sources()'s secondary_shopify_df/secondary_shopify_map).
+
+    Returns (agg_df, stats) where agg_df has one row per order with columns:
+    _key, _ref_raw, _order_date, _order_value, _shipping_fee, _row_count,
+    plus the first row's raw values for city/salesman under their
+    export_map column names.
+    """
+    stats = {}
+    work = export_df.copy()
+    stats['shopify_rows_total'] = len(work)
+
+    ref_col = export_map.get('ref_number')
+    if not ref_col:
+        stats['orders_total'] = 0
+        stats['orders_with_multiple_rows'] = 0
+        stats['canceled_excluded'] = 0
+        stats['fulfillment_excluded'] = 0
+        return pd.DataFrame(), stats
+
+    work = work[work[ref_col].astype(str).str.strip() != '']
+    work['_key'] = work[ref_col].map(clean_key)
+    work = work[work['_key'] != '']
+
+    value_col = export_map.get('order_value')
+    shipping_col = export_map.get('shipping_fee')
+    date_col = export_map.get('order_date')
+
+    rows = []
+    multi_row_orders = 0
+    canceled_excluded = 0
+    fulfillment_excluded = 0
+    for key, grp in work.groupby('_key', sort=False):
+        # The order-level row is always the first physical row Shopify wrote
+        # for this order (every later row in the group is a line-item-only
+        # continuation with the order-level columns left blank) -- NOT "first
+        # non-blank value" like a pandas .first() would give; iloc[0] is the
+        # correct, simpler pick here.
+        first = grp.iloc[0]
+        if canceled_col and exclude_canceled:
+            # 'Cancelled at' is a timestamp, blank unless the order was
+            # actually cancelled -- unlike Monthly POS Report's boolean-text
+            # 'Is canceled order' column, non-blank IS the "canceled" signal
+            # here (this function is only ever called for the Export Orders
+            # shape, so this convention is safe to hardcode).
+            if clean_display(first.get(canceled_col, '')) != '':
+                canceled_excluded += 1
+                continue
+        if fulfillment_col and allowed_fulfillment_statuses:
+            status = clean_display(first.get(fulfillment_col, ''))
+            if status.lower() not in [s.lower() for s in allowed_fulfillment_statuses]:
+                fulfillment_excluded += 1
+                continue
+        row = {
+            '_key': key,
+            '_ref_raw': first[ref_col],
+            '_order_date': parse_date_cell(first.get(date_col, '')) if date_col else None,
+            '_order_value': _to_number(first.get(value_col, '')) if value_col else None,
+            '_shipping_fee': _to_number(first.get(shipping_col, '')) if shipping_col else None,
+            '_row_count': len(grp),
+        }
+        for f in ('city', 'salesman'):
+            col = export_map.get(f)
+            # None (not '') when unmapped -- lets merge_sources() tell
+            # "not mapped on this upload" apart from "mapped but genuinely
+            # blank on this row" via pd.notna(), same convention as
+            # _order_value/_shipping_fee/_order_date above.
+            row[f'_first_{f}'] = first.get(col, '') if col else None
+        rows.append(row)
+        if len(grp) > 1:
+            multi_row_orders += 1
+
+    stats['orders_total'] = len(rows)
+    stats['orders_with_multiple_rows'] = multi_row_orders
+    stats['canceled_excluded'] = canceled_excluded
+    stats['fulfillment_excluded'] = fulfillment_excluded
+    return pd.DataFrame(rows), stats
+
+
 def merge_sources(
     target_key,
     shopify_df, shopify_map,
@@ -524,6 +669,8 @@ def merge_sources(
     allowed_fulfillment_statuses=None,
     fulfillment_col=None,
     include_shipping_fee=False,
+    export_orders_df=None,
+    export_orders_map=None,
 ):
     """Returns (merged_df, warnings, stats). One row per order, joined either
     Shopify-driven (every Shopify order shows up, shipping data filled in
@@ -531,7 +678,17 @@ def merge_sources(
     already with the shipping company show up, Shopify data filled in where
     matched -- now all three groups, UAE & Oman, Gulf, and Iraq) -- see
     TARGET_SHEETS[target_key]['join_base']. QA columns '_matched' / '_issues'
-    are for the in-app preview only, dropped before the final download."""
+    are for the in-app preview only, dropped before the final download.
+
+    export_orders_df/export_orders_map (Sep 2026, all three groups): a
+    SEPARATE, optional upload of Shopify's own native "Export orders" file.
+    Wherever an order is found there, its Subtotal/Shipping/Created at
+    OVERRIDE that order's Monthly POS Report/Sales overview-derived Order
+    Value/Shipping/Order date (see the '_order_value_override' /
+    '_shipping_fee_override' / '_order_date_override' handling in
+    fill_fields()) -- orders not found there are completely unaffected.
+    New/Returning Customer always comes from shopify_df/shopify_map, never
+    from this file (Export orders doesn't have that column at all)."""
     warnings = []
     fields = list(TARGET_SHEETS[target_key]['fields'])
     ref_prefix = TARGET_SHEETS[target_key]['ref_prefix']
@@ -546,13 +703,31 @@ def merge_sources(
         exclude_canceled=exclude_canceled, canceled_col=canceled_col,
         allowed_fulfillment_statuses=allowed_fulfillment_statuses, fulfillment_col=fulfillment_col,
     )
-    agg_index = {row['_key']: row for _, row in agg.iterrows()}
     if stats.get('orders_with_multiple_rows'):
         warnings.append(
             f"{stats['orders_with_multiple_rows']} order(s) had more than one row in the Shopify file "
             f"(a later return or an added item) -- Order Value was SUMMED across that order's rows, not "
             f"just taken from the first row. See the README for why this is correct."
         )
+
+    export_override_keys = set()
+    if len(agg) and export_orders_df is not None and export_orders_map and export_orders_map.get('ref_number'):
+        exp_agg, _exp_stats = aggregate_shopify_export_orders(export_orders_df, export_orders_map)
+        exp_index = {r['_key']: r for _, r in exp_agg.iterrows()}
+        agg['_order_value_override'] = agg['_key'].map(lambda k: exp_index[k]['_order_value'] if k in exp_index else None)
+        agg['_shipping_fee_override'] = agg['_key'].map(lambda k: exp_index[k]['_shipping_fee'] if k in exp_index else None)
+        agg['_order_date_override'] = agg['_key'].map(lambda k: exp_index[k]['_order_date'] if k in exp_index else None)
+        agg['_salesman_override'] = agg['_key'].map(lambda k: exp_index[k]['_first_salesman'] if k in exp_index else None)
+        export_override_keys = set(exp_index.keys()) & set(agg['_key'])
+        stats['export_orders_matched'] = len(export_override_keys)
+        if export_override_keys:
+            warnings.append(
+                f"{len(export_override_keys)} order(s) were also found in the Export Orders upload -- their "
+                f"Order Value/Shipping/Order date/Salesman came from THAT file (Subtotal/Shipping/Created at/"
+                f"Employee), not the Monthly POS Report/Sales overview derivation, for those orders only."
+            )
+
+    agg_index = {row['_key']: row for _, row in agg.iterrows()}
     if stats.get('orders_with_uncertain_date'):
         warnings.append(
             f"{stats['orders_with_uncertain_date']} order(s)' date might be WRONG: the earliest row seen for "
@@ -610,7 +785,16 @@ def merge_sources(
                 if orow is None:
                     val = None
                 elif field == 'order_date':
-                    val = orow['_order_date']
+                    # Export Orders override (Sep 2026) -- Created at is the
+                    # order's real placement date, not a financial-event
+                    # date, so it wins over the primary file's derived date
+                    # whenever this order was also found there.
+                    # pd.notna(), not `is not None` -- a numeric override
+                    # column with any real values gets upcast to float64,
+                    # which silently turns a non-matched order's None into
+                    # NaN, and `NaN is not None` is True in Python (would
+                    # wrongly treat "no override" as "override is blank").
+                    val = orow['_order_date_override'] if pd.notna(orow.get('_order_date_override')) else orow['_order_date']
                 elif field == 'city':
                     val, was_blank, was_unrec = normalize_city(orow['_first_city'], target_key, default_city_for_blank)
                     if was_blank:
@@ -619,16 +803,36 @@ def merge_sources(
                         unrecognized_city_count += 1
                         issues.append(f"unrecognized shipping country: {orow['_first_city']!r}")
                 elif field == 'salesman':
-                    val = resolve_salesman(orow['_first_salesman'])
+                    # Export Orders override (Sep 2026, per Mahmoud) --
+                    # Employee is order-level data, same as Subtotal/
+                    # Shipping/Created at (just written on the order's
+                    # first line-item row like the rest of that file's
+                    # order-level fields, not a per-line-item value), so
+                    # it wins the same way whenever this order was also
+                    # found there and Employee was mapped on that upload.
+                    if pd.notna(orow.get('_salesman_override')):
+                        val = resolve_salesman(orow['_salesman_override'])
+                    else:
+                        val = resolve_salesman(orow['_first_salesman'])
                 elif field == 'order_value':
-                    # Total sales INCLUDES shipping (subtotal + taxes + fees +
-                    # shipping + reversals, per Shopify's own definition) --
-                    # once Shipping is broken out as its own column, Value
-                    # should be the goods-only amount (Net sales), or Value +
-                    # Shipping would double-count the shipping fee. Falls
-                    # back to Total sales only when no Net sales column was
-                    # mapped at all (nothing to split it with).
-                    val = orow['_net_sales'] if orow['_net_sales'] is not None else orow['_order_value']
+                    # Export Orders override (Sep 2026, all three groups) --
+                    # if this order was ALSO found in an optional Export
+                    # Orders upload, its own Subtotal (goods only, already
+                    # tax-inclusive, no derivation needed) wins outright --
+                    # more accurate than anything derivable from the primary
+                    # file. See merge_sources()'s export_orders_df handling.
+                    if pd.notna(orow.get('_order_value_override')):
+                        val = orow['_order_value_override']
+                    else:
+                        # Total sales INCLUDES shipping (subtotal + taxes +
+                        # fees + shipping + reversals, per Shopify's own
+                        # definition) -- once Shipping is broken out as its
+                        # own column, Value should be the goods-only amount
+                        # (Net sales), or Value + Shipping would double-count
+                        # the shipping fee. Falls back to Total sales only
+                        # when no Net sales column was mapped at all (nothing
+                        # to split it with).
+                        val = orow['_net_sales'] if orow['_net_sales'] is not None else orow['_order_value']
                 elif field in ('new_customer', 'returning_customer'):
                     if TARGET_SHEETS[target_key].get('new_returning_combined'):
                         # Gulf's Shopify export has ONE text column ("New" /
@@ -642,7 +846,13 @@ def merge_sources(
                 else:
                     val = ''
             elif source == 'computed':
-                val = (orow['_order_value'] - orow['_net_sales']) if (orow is not None and orow['_net_sales'] is not None) else None
+                # Export Orders override (Sep 2026) -- its own Shipping
+                # column wins outright over the Total-minus-Net derivation
+                # whenever this order was also found there.
+                if orow is not None and pd.notna(orow.get('_shipping_fee_override')):
+                    val = orow['_shipping_fee_override']
+                else:
+                    val = (orow['_order_value'] - orow['_net_sales']) if (orow is not None and orow['_net_sales'] is not None) else None
             elif source == 'gulf_value_full':
                 # Gulf Order Value (TEMPORARY rule, Mahmoud Aug 2026 v2):
                 # Shipping is no longer broken out at all, so Value carries
@@ -665,6 +875,12 @@ def merge_sources(
                     primary_num = cargo_num
                 if primary_num:
                     val = primary_num
+                elif orow is not None and pd.notna(orow.get('_order_value_override')):
+                    # Export Orders override (Sep 2026) -- only reached when
+                    # the shipping file itself had no COD Amount/Cargo Value
+                    # for this order; Subtotal is a better fallback than the
+                    # Sales overview-derived Net/Total sales below it.
+                    val = orow['_order_value_override']
                 elif orow is not None:
                     val = orow['_net_sales'] if orow['_net_sales'] is not None else orow['_order_value']
                 else:
@@ -718,7 +934,9 @@ def merge_sources(
                 srow_ship = shipping_df.loc[ship_matches[0]]
             else:
                 issues.append('no matching shipping-company row yet')
-            if orow.get('_date_uncertain'):
+            if orow.get('_date_uncertain') and key not in export_override_keys:
+                # Not an issue if Export Orders also covers this order -- its
+                # Created at overrides the uncertain Monthly POS Report date.
                 issues.append('order date may be wrong -- earliest row in this file is not a positive sale')
 
             row_out = {ref_header: make_ref_display(orow['_ref_raw'])}
@@ -744,7 +962,9 @@ def merge_sources(
             orow = agg_index.get(key)
             if orow is None:
                 issues.append('no matching Shopify order found yet')
-            elif orow.get('_date_uncertain'):
+            elif orow.get('_date_uncertain') and key not in export_override_keys:
+                # Not an issue if Export Orders also covers this order -- its
+                # Created at overrides the uncertain Monthly POS Report date.
                 issues.append('order date may be wrong -- earliest row in this file is not a positive sale')
 
             ref_raw = srow_ship.get(ship_ref_col, '') if ship_ref_col else ''
