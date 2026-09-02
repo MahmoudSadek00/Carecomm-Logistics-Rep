@@ -3,7 +3,7 @@ import datetime as dt
 import streamlit as st
 
 from engine import (
-    TARGET_SHEETS, FIELD_LABELS, SHOPIFY_DEFAULTS, SHIPPING_DEFAULTS,
+    TARGET_SHEETS, FIELD_LABELS, SHOPIFY_DEFAULTS, SHIPPING_DEFAULTS, EXPORT_ORDERS_DEFAULTS,
     read_any, default_mapping, merge_sources, workbook_to_bytes,
 )
 
@@ -144,20 +144,25 @@ if shopify_file is not None:
                 )
 
     with st.expander("Filters (optional columns on the Shopify file)"):
+        # 'Cancelled at' (Export Orders -- a timestamp, blank unless
+        # cancelled) vs 'Is canceled order' (Monthly POS Report -- boolean
+        # text) -- try both, whichever is actually present in this file.
         cancel_options = ['(none)'] + shopify_df.columns.tolist()
-        canceled_guess = ['Is canceled order'] if 'Is canceled order' in shopify_df.columns else []
+        canceled_candidates = ['Is canceled order', 'Cancelled at']
+        canceled_guess = next((c for c in canceled_candidates if c in shopify_df.columns), None)
         canceled_col_choice = st.selectbox(
             "Cancelled-order column", cancel_options,
-            index=cancel_options.index(canceled_guess[0]) if canceled_guess else 0,
+            index=cancel_options.index(canceled_guess) if canceled_guess else 0,
         )
         canceled_col = None if canceled_col_choice == '(none)' else canceled_col_choice
         exclude_canceled = st.checkbox("Exclude cancelled orders", value=True, disabled=canceled_col is None)
 
         fulfill_options = ['(none)'] + shopify_df.columns.tolist()
-        fulfill_guess = ['Order fulfillment status'] if 'Order fulfillment status' in shopify_df.columns else []
+        fulfill_candidates = ['Order fulfillment status', 'Fulfillment Status']
+        fulfill_guess = next((c for c in fulfill_candidates if c in shopify_df.columns), None)
         fulfillment_col_choice = st.selectbox(
             "Fulfillment-status column", fulfill_options,
-            index=fulfill_options.index(fulfill_guess[0]) if fulfill_guess else 0,
+            index=fulfill_options.index(fulfill_guess) if fulfill_guess else 0,
         )
         fulfillment_col = None if fulfillment_col_choice == '(none)' else fulfillment_col_choice
         if fulfillment_col:
@@ -166,6 +171,39 @@ if shopify_file is not None:
                 "Include only these statuses (leave all checked to include everything)",
                 options=statuses_present, default=statuses_present,
             )
+
+# ---------------------------------------------------------------------------
+# 2b. Export Orders (optional, all three groups, Sep 2026) -- when uploaded,
+# overrides Order Value/Shipping/Order date/Salesman for whichever orders it
+# covers. See engine.py's aggregate_shopify_export_orders() / merge_sources()
+# docstrings.
+# ---------------------------------------------------------------------------
+st.header("2b. Export Orders (optional -- overrides Order Value / Shipping / Order date / Salesman)")
+st.caption(
+    "Shopify's own native 'Export orders' file (Orders page -> Export, NOT the Monthly POS Report/Sales "
+    "overview file above). Upload this same batch's Export orders here and, wherever an order is found "
+    "in BOTH files, its Subtotal/Shipping/Created at/Employee from THIS file win over the Order Value/"
+    "Shipping/Order date/Salesman derived from the report above -- more accurate, no VAT/Total-minus-Net "
+    "derivation needed. Orders only in the report above (not in this file) are unaffected. Leave this "
+    "empty to use the report above for every order, same as before."
+)
+export_orders_df = None
+export_orders_map = {}
+export_orders_file = st.file_uploader("Export orders (csv or xlsx)", type=['csv', 'xlsx', 'xls'], key='export_orders')
+if export_orders_file is not None:
+    export_orders_df = read_any(export_orders_file)
+    st.write(f"{len(export_orders_df)} rows loaded.")
+    guessed_eo = default_mapping(export_orders_df.columns.tolist(), EXPORT_ORDERS_DEFAULTS)
+    cols_eo = st.columns(3)
+    for i, field in enumerate(['ref_number', 'order_value', 'shipping_fee', 'order_date', 'salesman']):
+        with cols_eo[i % 3]:
+            options_eo = ['(none)'] + export_orders_df.columns.tolist()
+            default_eo = guessed_eo.get(field)
+            idx_eo = options_eo.index(default_eo) if default_eo in options_eo else 0
+            choice_eo = st.selectbox(FIELD_LABELS[field], options_eo, index=idx_eo, key=f'export_orders_{target_key}_{field}')
+            export_orders_map[field] = None if choice_eo == '(none)' else choice_eo
+    if not export_orders_map.get('ref_number'):
+        st.warning("Pick the Reference/Order Number column on this file too, or it can't be matched to anything.")
 
 # ---------------------------------------------------------------------------
 # 3. Shipping company file + column mapping
@@ -232,6 +270,8 @@ if st.button("Merge files", disabled=not ready, type="primary"):
             allowed_fulfillment_statuses=allowed_statuses,
             fulfillment_col=fulfillment_col,
             include_shipping_fee=include_shipping_fee,
+            export_orders_df=export_orders_df,
+            export_orders_map=export_orders_map,
         )
 
     if join_base == 'shopify':
