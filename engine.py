@@ -93,6 +93,7 @@ TARGET_SHEETS = {
             ('Salesman', 'salesman', 'shopify'),
             ('Order Value', 'order_value', 'shopify'),
             ('Shipping', 'shipping_fee', 'computed'),
+            ('Payment Method', 'payment_type', 'shipping'),
             ('date', 'blank', 'blank'),
             ('', 'blank', 'blank'),  # unnamed column in the real sheet
             ('Notes', 'blank', 'blank'),
@@ -144,6 +145,7 @@ TARGET_SHEETS = {
             # Cargo-Value split (v1, still in git history if ever needed).
             ('Order Value', 'order_value', 'gulf_value_full'),
             ('Shipping', 'shipping_fee', 'zero'),
+            ('Payment Method', 'payment_type', 'shipping'),
             ('date', 'blank', 'blank'),
             ('', 'blank', 'blank'),  # unnamed column #1 in the real sheet
             ('', 'blank', 'blank'),  # unnamed column #2 in the real sheet
@@ -196,6 +198,7 @@ TARGET_SHEETS = {
             ('City', 'city', 'shipping'),
             ('Value', 'order_value', 'shopify'),
             ('Shipping', 'shipping_fee', 'computed'),
+            ('Payment Method', 'payment_type', 'shipping'),
             ('status', 'blank', 'blank'),
             ('Notes', 'blank', 'blank'),
             ('Analysis', 'blank', 'blank'),
@@ -445,6 +448,7 @@ def aggregate_shopify_orders(
     if not ref_col:
         stats['orders_total'] = 0
         stats['orders_with_multiple_rows'] = 0
+        stats['orders_with_uncertain_date'] = 0
         return pd.DataFrame(), stats
 
     work = work[work[ref_col].astype(str).str.strip() != '']
@@ -475,6 +479,18 @@ def aggregate_shopify_orders(
             pick_from = grp_sorted
             real_row_count = len(grp)
         first = pick_from.iloc[0]
+        # "Earliest row" is only the TRUE order date if the original sale row
+        # is actually present in this upload -- if the file's date window
+        # starts after the order was really placed, the earliest row we can
+        # see is a later event instead (a return/cancellation adjustment,
+        # which is negative or zero), and _order_date silently comes out
+        # wrong (a real, later date, so it doesn't even look obviously off).
+        # A non-positive Total sales on the picked row is the tell: a real
+        # original order-placement row is always a positive sale. (Sep 2026,
+        # per Mahmoud -- surfaced after the ShopifyQL "Day" column turned out
+        # to mean "day of the financial event", not "day the order was
+        # created", for the exact same underlying reason.)
+        date_uncertain = bool(first['_total_num'] <= 0)
         row = {
             '_key': key,
             '_ref_raw': first[ref_col],
@@ -482,6 +498,7 @@ def aggregate_shopify_orders(
             '_order_value': grp['_total_num'].sum(),
             '_net_sales': grp['_net_num'].sum() if net_col else None,
             '_row_count': real_row_count,
+            '_date_uncertain': date_uncertain,
         }
         for f in ('city', 'salesman', 'new_customer', 'returning_customer', 'new_or_returning'):
             col = shopify_map.get(f)
@@ -492,6 +509,7 @@ def aggregate_shopify_orders(
 
     stats['orders_total'] = len(rows)
     stats['orders_with_multiple_rows'] = multi_row_orders
+    stats['orders_with_uncertain_date'] = sum(1 for r in rows if r['_date_uncertain'])
     return pd.DataFrame(rows), stats
 
 
@@ -534,6 +552,14 @@ def merge_sources(
             f"{stats['orders_with_multiple_rows']} order(s) had more than one row in the Shopify file "
             f"(a later return or an added item) -- Order Value was SUMMED across that order's rows, not "
             f"just taken from the first row. See the README for why this is correct."
+        )
+    if stats.get('orders_with_uncertain_date'):
+        warnings.append(
+            f"{stats['orders_with_uncertain_date']} order(s)' date might be WRONG: the earliest row seen for "
+            f"that order in this Shopify file is not a positive sale (Total sales <= 0) -- which usually means "
+            f"the order was actually placed BEFORE this file's date range, and only a later return/cancellation "
+            f"is showing up here. Re-export the Shopify file with an earlier start date to fix this (see the "
+            f"README's 'Order date can come out wrong' section) -- flagged rows are marked in '_issues'."
         )
     # The Total-sales-minus-Net-sales derivation only applies to the 'computed'
     # source (UAE/Oman, Iraq). Gulf's 'computed_cod_shipping' derives Shipping
@@ -692,6 +718,8 @@ def merge_sources(
                 srow_ship = shipping_df.loc[ship_matches[0]]
             else:
                 issues.append('no matching shipping-company row yet')
+            if orow.get('_date_uncertain'):
+                issues.append('order date may be wrong -- earliest row in this file is not a positive sale')
 
             row_out = {ref_header: make_ref_display(orow['_ref_raw'])}
             fill_fields(row_out, issues, orow, srow_ship)
@@ -716,6 +744,8 @@ def merge_sources(
             orow = agg_index.get(key)
             if orow is None:
                 issues.append('no matching Shopify order found yet')
+            elif orow.get('_date_uncertain'):
+                issues.append('order date may be wrong -- earliest row in this file is not a positive sale')
 
             ref_raw = srow_ship.get(ship_ref_col, '') if ship_ref_col else ''
             row_out = {ref_header: make_ref_display(ref_raw)}
