@@ -4,7 +4,7 @@ import streamlit as st
 
 from engine import (
     TARGET_SHEETS, FIELD_LABELS, SHOPIFY_DEFAULTS, SHIPPING_DEFAULTS,
-    read_any, default_mapping, merge_sources, workbook_to_bytes,
+    read_any, default_mapping, guess_column, merge_sources, workbook_to_bytes,
 )
 
 st.set_page_config(page_title="Orders Consolidation Tool", layout="wide")
@@ -57,6 +57,15 @@ if shopify_file is not None:
     shopify_df = read_any(shopify_file)
     st.write(f"{len(shopify_df)} rows loaded.")
     guessed = default_mapping(shopify_df.columns.tolist(), SHOPIFY_DEFAULTS)
+    if target_key in ('iraq', 'gulf'):
+        # Iraq and Gulf: default the 'Order value' dropdown itself to Net
+        # sales when the file has one, ahead of Total sales -- Net sales is
+        # what actually gets used for these two groups' Order Value anyway
+        # (see fill_fields's order_value branch), so defaulting the visible
+        # dropdown to match avoids it looking like Total sales is picked.
+        net_sales_col = guess_column(shopify_df.columns.tolist(), SHOPIFY_DEFAULTS['net_sales'])
+        if net_sales_col:
+            guessed['order_value'] = net_sales_col
 
     # 'ref_number' and 'order_value' are always needed on the Shopify side
     # (to group/aggregate an order's rows, and as the Gulf Order Value
