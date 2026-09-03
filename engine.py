@@ -155,15 +155,18 @@ TARGET_SHEETS = {
             ('Consignee Phone', 'phone', 'shipping'),
             ('AWB', 'waybill', 'shipping'),
             ('Salesman', 'salesman', 'shopify'),
-            # TEMPORARY rule confirmed by Mahmoud (Aug 2026, v2): Shipping is
-            # no longer broken out at all for Gulf -- it's always written as
-            # 0, and Value carries the FULL order amount instead (COD Amount
-            # for COD orders, since that's the complete amount collected;
-            # Cargo Value for Prepaid, the only signal this file has for
-            # them). See the 'gulf_value_full' / 'zero' branches in
-            # fill_fields() below. Supersedes the earlier COD-Amount-minus-
-            # Cargo-Value split (v1, still in git history if ever needed).
-            ('Order Value', 'order_value', 'gulf_value_full'),
+            # Order Value = Shopify's own Total sales (Sep 2026, per Mahmoud,
+            # ALL Gulf countries, not just Saudi) -- SUPERSEDES the Aug 2026
+            # v2 rule that used the shipping file's COD Amount/Cargo Value
+            # (see 'gulf_value_full' in git history if ever needed). Reason:
+            # the shipping company doesn't reliably write the real order
+            # price -- for Prepaid orders especially, nothing is collected on
+            # delivery so there's no reason for them to record an accurate
+            # amount there at all. Reuses the plain 'shopify' path (same as
+            # Iraq) -- Gulf's Sales overview format has no Net sales column,
+            # so it always falls through to Total sales directly. Shipping
+            # stays 0 (unchanged, still no reliable way to split it out).
+            ('Order Value', 'order_value', 'shopify'),
             ('Shipping', 'shipping_fee', 'zero'),
             ('Payment Method', 'payment_type', 'shipping'),
             ('date', 'blank', 'blank'),
@@ -182,9 +185,11 @@ TARGET_SHEETS = {
         # not tied to any single output field on their own -- forced into
         # the shipping mapping UI in app.py regardless of whether a 'fields'
         # entry declares them as its source. 'country' feeds Consignee City
-        # (via 'shipping_country' above); cargo_value/cod_amount/payment_type
-        # feed the Order Value/Shipping rules.
-        'extra_shipping_fields': ['country', 'cargo_value', 'cod_amount', 'payment_type'],
+        # (via 'shipping_country' above); 'payment_type' feeds the visible
+        # Payment Method output column. cargo_value/cod_amount are no longer
+        # needed here (Sep 2026 -- Order Value now comes from Shopify, see
+        # the 'fields' comment above).
+        'extra_shipping_fields': ['country', 'payment_type'],
         # Gulf's "Sales overview" export has one row per (order, day) across
         # the WHOLE report date range (all zeros except the real event day)
         # -- NOT one row per return/edit event like Monthly POS Report. Without
@@ -585,11 +590,10 @@ def merge_sources(
         )
     # The Total-sales-minus-Net-sales derivation only applies to the 'computed'
     # source (Iraq) and 'uae_vat_computed' (UAE & Oman, same idea with the VAT
-    # add-back folded in -- see fill_fields()). Gulf's 'zero'/'gulf_value_full'
-    # derives Value from the shipping file's own COD Amount/Cargo Value instead
-    # and doesn't need Net sales at all -- warning about a missing Net sales
-    # mapping there would be actively misleading. Check the sheet's actual
-    # shipping_fee source directly rather than the caller's raw
+    # add-back folded in -- see fill_fields()). Gulf's Shipping source is
+    # 'zero' (always 0, no Net sales needed) -- warning about a missing Net
+    # sales mapping there would be actively misleading. Check the sheet's
+    # actual shipping_fee source directly rather than the caller's raw
     # include_shipping_fee flag -- that flag alone used to short-circuit this
     # check via `or`, firing the warning even when the real source didn't need
     # Net sales at all.
@@ -650,10 +654,12 @@ def merge_sources(
                     # once Shipping is broken out as its own column, Value
                     # should be the goods-only amount (Net sales), or
                     # Value + Shipping would double-count the shipping fee.
-                    # Falls back to Total sales only when no Net sales column
-                    # was mapped at all (nothing to split it with). Iraq only
-                    # -- UAE & Oman uses 'uae_vat' below (VAT add-back), Gulf
-                    # uses 'gulf_value_full'.
+                    # Falls back to Total sales when no Net sales column was
+                    # mapped at all (nothing to split it with) -- which is
+                    # ALWAYS the case for Gulf (its Sales overview format has
+                    # no Net sales column at all, see TARGET_SHEETS['gulf']),
+                    # so this always resolves to plain Total sales for Gulf.
+                    # UAE & Oman uses 'uae_vat' below instead (VAT add-back).
                     val = orow['_net_sales'] if orow['_net_sales'] is not None else orow['_order_value']
                 elif field in ('new_customer', 'returning_customer'):
                     if TARGET_SHEETS[target_key].get('new_returning_combined'):
@@ -700,38 +706,12 @@ def merge_sources(
                     val = orow['_order_value'] - (orow['_net_sales'] * 1.05)
                 else:
                     val = None
-            elif source == 'gulf_value_full':
-                # Gulf Order Value (TEMPORARY rule, Mahmoud Aug 2026 v2):
-                # Shipping is no longer broken out at all, so Value carries
-                # the FULL order amount -- COD Amount for COD orders (the
-                # complete amount collected on delivery, goods + shipping
-                # together), Cargo Value for Prepaid orders (the only signal
-                # this file has for them -- Prepaid rows never populate COD
-                # Amount, nothing is collected on delivery). Falls back to
-                # Shopify's own order value only when the shipping file's
-                # own number comes back blank/zero.
-                pay_col = shipping_map.get('payment_type')
-                pay_raw = clean_display(srow_ship.get(pay_col, '')) if (srow_ship is not None and pay_col) else ''
-                cargo_col = shipping_map.get('cargo_value')
-                cargo_num = _to_number(srow_ship.get(cargo_col, '')) if (srow_ship is not None and cargo_col) else None
-                if pay_raw.strip().lower() == 'cod':
-                    cod_col = shipping_map.get('cod_amount')
-                    cod_num = _to_number(srow_ship.get(cod_col, '')) if (srow_ship is not None and cod_col) else None
-                    primary_num = cod_num if cod_num else cargo_num
-                else:
-                    primary_num = cargo_num
-                if primary_num:
-                    val = primary_num
-                elif orow is not None:
-                    val = orow['_net_sales'] if orow['_net_sales'] is not None else orow['_order_value']
-                else:
-                    val = None
             elif source == 'zero':
-                # Gulf Shipping (TEMPORARY rule, Mahmoud Aug 2026 v2): no
-                # longer split out at all -- always written as 0, with the
-                # full amount folded into Value instead (see
-                # 'gulf_value_full' above). Supersedes the earlier COD-
-                # Amount-minus-Cargo-Value derivation.
+                # Gulf Shipping -- not split out at all, always written as 0
+                # (no reliable source to derive it from). Order Value now
+                # comes from Shopify's own Total sales instead (Sep 2026, see
+                # TARGET_SHEETS['gulf']'s 'fields' comment) -- this branch is
+                # unrelated to that and unchanged.
                 val = 0
             elif source == 'shipping_country':
                 # Gulf's output 'Consignee City' column is actually the
