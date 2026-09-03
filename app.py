@@ -107,15 +107,21 @@ if shopify_file is not None:
     shipping_fee_source = next((s for h, f, s in fields if f == 'shipping_fee'), None)
 
     if shipping_fee_source == 'zero':
-        # Gulf (v2, Aug 2026): Shipping is no longer broken out at all --
-        # always written as 0, with the full order amount folded into Value
-        # instead (COD Amount for COD orders, Cargo Value for Prepaid,
-        # mapped in step 3 below). No Net sales involved, nothing to map here.
+        # Gulf (v2, Sep 2026): Shipping is not broken out at all -- always
+        # written as 0. Order Value uses this sheet's Net sales column when
+        # one is mapped below, otherwise it falls back to the Order Value
+        # column picked above (Total sales).
         st.caption(
-            "Shipping for this sheet is not broken out -- always written as 0. Order Value carries the "
-            "FULL amount instead: COD Amount for COD orders, Cargo Value for Prepaid (mapped in step 3 "
-            "below). TEMPORARY rule pending a better long-term source."
+            "Shipping for this sheet is not broken out -- always written as 0. Order Value uses Net sales "
+            "below when mapped, otherwise it falls back to the Order Value column picked above (Total sales)."
         )
+        options = ['(none)'] + shopify_df.columns.tolist()
+        net_guess = ['Net sales'] if 'Net sales' in shopify_df.columns else []
+        net_choice = st.selectbox(
+            FIELD_LABELS['net_sales'], options, index=options.index(net_guess[0]) if net_guess else 0,
+            key=f'shopify_{target_key}_net_sales',
+        )
+        shopify_map['net_sales'] = None if net_choice == '(none)' else net_choice
         include_shipping_fee = True
     else:
         shipping_fee_box_title = (
