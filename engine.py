@@ -102,6 +102,9 @@ TARGET_SHEETS = {
         'fields': [
             ('shipping date', 'blank', 'blank'),
             ('Reference Number', 'ref_number', 'shipping'),
+            # Sep 2026, per Mahmoud -- "Sep 2026" style label, 3rd column,
+            # same across all 3 groups. See format_month_year().
+            ('Month', 'month', 'month'),
             ('Order date', 'order_date', 'shopify'),
             ('Consignee City', 'city', 'shopify'),
             ('Consignee Phone', 'phone', 'shipping'),
@@ -143,6 +146,9 @@ TARGET_SHEETS = {
         'fields': [
             ('shipping date', 'blank', 'blank'),
             ('Reference Number', 'ref_number', 'shipping'),
+            # Sep 2026, per Mahmoud -- "Sep 2026" style label, 3rd column,
+            # same across all 3 groups. See format_month_year().
+            ('Month', 'month', 'month'),
             ('Order date', 'order_date', 'shopify'),
             # Despite its name, the raw sheet's 'Consignee City' column
             # actually holds the COUNTRY code (SA/KW/QA), not a real city --
@@ -213,14 +219,18 @@ TARGET_SHEETS = {
         # outcome isn't known at this stage, same as UAE/Gulf. Shipping is
         # baked in right after Value (per Mahmoud's spec), computed as
         # Total sales - Net sales, same derivation as the optional Shipping
-        # column on UAE/Gulf.
+        # column on UAE/Gulf. Month (3rd column) and Salesman (right after
+        # City) added Sep 2026, per Mahmoud -- Iraq didn't have either before
+        # (unlike UAE & Oman / Gulf, which already had Salesman).
         'fields': [
             ('date ship', 'blank', 'blank'),
             ('ReceiptNumber', 'ref_number', 'shipping'),
+            ('Month', 'month', 'month'),
             ('date greeting', 'order_date', 'shopify'),
             ('Name', 'consignee_name', 'shipping'),
             ('PhoneNumber', 'phone', 'shipping'),
             ('City', 'city', 'shipping'),
+            ('Salesman', 'salesman', 'shopify'),
             ('Value', 'order_value', 'shopify'),
             ('Shipping', 'shipping_fee', 'computed'),
             ('Payment Method', 'payment_type', 'shipping'),
@@ -421,6 +431,21 @@ def parse_date_cell(value, convention='month_first'):
         return dt.date(year, month, day)
     except ValueError:
         return None
+
+
+# Fixed English abbreviations (Sep 2026, per Mahmoud) -- NOT date.strftime('%b'),
+# which is locale-dependent (would print the server locale's own month names, e.g.
+# Arabic, if that's ever set) and NOT written as a real date cell either, unlike Order
+# date -- Month is a plain "Sep 2026"-style label, not a value anyone recomputes from.
+_MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+
+def format_month_year(d):
+    """'Sep 2026' style label from a date (or None if d is None/falsy) -- see
+    _MONTH_ABBR above for why this doesn't just use strftime('%b')."""
+    if not d:
+        return None
+    return f"{_MONTH_ABBR[d.month - 1]} {d.year}"
 
 
 def aggregate_shopify_orders(
@@ -713,6 +738,12 @@ def merge_sources(
                 # TARGET_SHEETS['gulf']'s 'fields' comment) -- this branch is
                 # unrelated to that and unchanged.
                 val = 0
+            elif source == 'month':
+                # "Sep 2026" style label derived from Order date (Sep 2026, per
+                # Mahmoud -- all 3 groups). Same _order_date the 'order_date' field
+                # itself uses, so it always agrees with whatever's in that column on
+                # the same row -- None (blank) when unmatched, same as order_date.
+                val = format_month_year(orow['_order_date']) if orow is not None else None
             elif source == 'shipping_country':
                 # Gulf's output 'Consignee City' column is actually the
                 # COUNTRY code (SA/KW/QA), confirmed by Mahmoud (Aug 2026) --
