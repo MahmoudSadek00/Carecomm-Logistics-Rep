@@ -923,6 +923,26 @@ def workbook_to_bytes(df, target_key, include_shipping_fee=False):
             cell.font = body_font
             if isinstance(val, dt.date):
                 cell.number_format = 'MM/DD/YYYY'
+            elif isinstance(val, (int, float)) and not isinstance(val, bool):
+                # Sep 2026, per Mahmoud, ALL 3 sheets (not just Gulf): every
+                # plain numeric cell (Order Value, Shipping, New/Returning
+                # Customer Orders) gets an EXPLICIT 'General' number format
+                # here, rather than leaving it unset. Left unset, a cell's
+                # displayed format on paste can end up inherited from
+                # whatever the DESTINATION Google Sheet column was
+                # previously formatted as (e.g. a leftover date format on
+                # that column from before Month got inserted and shifted
+                # everything right -- see the 'Month column' README section)
+                # -- Google Sheets then renders the plain number as a date
+                # (small numbers land in 1899/1900), and if someone later
+                # copies the TEXT format from a neighboring column onto it to
+                # "fix" the look, what shows up is the date's underlying
+                # serial number (a big integer), not the real value. Setting
+                # 'General' explicitly here means a normal (not values-only)
+                # paste always carries the correct plain-number format along
+                # with the value, overriding whatever the destination column
+                # had.
+                cell.number_format = 'General'
 
     for c, col_name in enumerate(headers, start=1):
         ws.column_dimensions[get_column_letter(c)].width = max(14, len(col_name) + 2)
