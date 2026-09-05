@@ -116,13 +116,17 @@ if shopify_file is not None:
     shipping_fee_source = next((s for h, f, s in fields if f == 'shipping_fee'), None)
 
     if shipping_fee_source == 'zero':
-        # Gulf (v2, Sep 2026): Shipping is not broken out at all -- always
-        # written as 0. Order Value uses this sheet's Net sales column when
-        # one is mapped below, otherwise it falls back to the Order Value
-        # column picked above (Total sales).
+        # Gulf (Sep 2026): Shipping and Order Value now both key off the
+        # 'Shipping charges' dropdown above (in the main Shopify fields grid,
+        # forced in via TARGET_SHEETS['gulf']['extra_shopify_fields']) when
+        # this file has that column -- Shipping = Shipping charges as-is,
+        # Order Value = Total sales minus it. Net sales below is the
+        # fallback for older Gulf exports that don't have Shipping charges
+        # yet; plain Total sales is the last resort if neither is mapped.
         st.caption(
-            "Shipping for this sheet is not broken out -- always written as 0. Order Value uses Net sales "
-            "below when mapped, otherwise it falls back to the Order Value column picked above (Total sales)."
+            "Order Value / Shipping priority for this sheet: 'Shipping charges' above (Value = Total sales "
+            "minus it, Shipping = it, as-is) > Net sales below (Value = Net sales, Shipping = 0) > plain "
+            "Total sales (Value = Total sales, Shipping = 0)."
         )
         options = ['(none)'] + shopify_df.columns.tolist()
         net_guess = ['Net sales'] if 'Net sales' in shopify_df.columns else []
