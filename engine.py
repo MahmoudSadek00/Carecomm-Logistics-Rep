@@ -926,23 +926,26 @@ def workbook_to_bytes(df, target_key, include_shipping_fee=False):
             elif isinstance(val, (int, float)) and not isinstance(val, bool):
                 # Sep 2026, per Mahmoud, ALL 3 sheets (not just Gulf): every
                 # plain numeric cell (Order Value, Shipping, New/Returning
-                # Customer Orders) gets an EXPLICIT 'General' number format
-                # here, rather than leaving it unset. Left unset, a cell's
-                # displayed format on paste can end up inherited from
-                # whatever the DESTINATION Google Sheet column was
-                # previously formatted as (e.g. a leftover date format on
-                # that column from before Month got inserted and shifted
-                # everything right -- see the 'Month column' README section)
-                # -- Google Sheets then renders the plain number as a date
-                # (small numbers land in 1899/1900), and if someone later
-                # copies the TEXT format from a neighboring column onto it to
-                # "fix" the look, what shows up is the date's underlying
-                # serial number (a big integer), not the real value. Setting
-                # 'General' explicitly here means a normal (not values-only)
-                # paste always carries the correct plain-number format along
-                # with the value, overriding whatever the destination column
-                # had.
-                cell.number_format = 'General'
+                # Customer Orders) gets an EXPLICIT plain-number format here,
+                # rather than being left unset ('General') or inheriting
+                # whatever the DESTINATION Google Sheet cell/column was
+                # previously formatted as. Confirmed against a real cell in
+                # Mahmoud's live sheet (Sep 2026): an Order Value of 7.7
+                # landed in a cell that still carried a stale Date format
+                # from that row's own earlier history, so it displayed as a
+                # date (2026-07-07) even though the underlying number was
+                # never touched -- 'General' alone turned out not to be a
+                # strong enough signal to always override that on paste, so
+                # this uses an explicit numeric pattern ('0.####' -- plain
+                # digits, optional up to 4 decimals, no thousands separator,
+                # nothing that could ever parse as a date token) instead,
+                # which Sheets treats as a hard override during a normal
+                # (non-values-only) paste. This only protects NEW pastes,
+                # though -- a cell already corrupted in the live sheet from
+                # before this fix needs a one-time manual reset there
+                # (select it, Format > Number > Automatic, then re-paste/
+                # retype the correct value).
+                cell.number_format = '0.####'
 
     for c, col_name in enumerate(headers, start=1):
         ws.column_dimensions[get_column_letter(c)].width = max(14, len(col_name) + 2)
