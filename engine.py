@@ -202,8 +202,12 @@ TARGET_SHEETS = {
         # this, aggregate_shopify_orders' "earliest row" pick grabs the first
         # calendar day of the report instead of the order's actual date.
         # Forced into the Shopify mapping UI in app.py, same mechanism as
-        # extra_shipping_fields above.
-        'extra_shopify_fields': ['event_time'],
+        # extra_shipping_fields above. 'shipping_charges' (Sep 2026, per
+        # Mahmoud): a real Shipping charges column now exists in Gulf's
+        # export -- see FIELD_LABELS['shipping_charges'] and fill_fields's
+        # 'order_value'/'zero' branches for how it drives both Value and
+        # Shipping once mapped.
+        'extra_shopify_fields': ['event_time', 'shipping_charges'],
     },
     'iraq': {
         'label': 'Iraq',
@@ -257,6 +261,12 @@ FIELD_LABELS = {
     'returning_customer': 'Returning-customer flag',
     'consignee_name': 'Consignee / recipient name',
     'net_sales': 'Net sales (for the optional Shipping column)',
+    'shipping_charges': (
+        "Shipping charges (Gulf's Shopify export only, Sep 2026, summed across an order's rows) -- "
+        "when mapped, Shipping = this value as-is and Order Value = Total sales minus this value. "
+        "Takes priority over Net sales for Gulf's Order Value; falls back to Net sales (then plain "
+        "Total sales) when this column isn't mapped."
+    ),
     'new_or_returning': "New or returning customer (single combined column, Gulf's own Shopify export)",
     'country': "Consignee Country (SA/KW/QA on the shipping file -- feeds the output 'Consignee City' column, which despite its name holds the country code, not an actual city)",
     'cargo_value': "Cargo Value (goods value on the shipping file -- Gulf's Order Value source for Prepaid orders, and fallback for COD orders)",
@@ -278,6 +288,7 @@ SHOPIFY_DEFAULTS = {
     'salesman': ['Staff member name'],
     'order_value': ['Total sales', 'Total'],
     'net_sales': ['Net sales'],
+    'shipping_charges': ['Shipping charges'],
     'new_customer': ['Orders (first-time)', 'New Customer Orders'],
     'returning_customer': ['Orders (returning)', 'Returning Customer Orders'],
     # Gulf's "Sales overview" export only -- see new_returning_combined.
@@ -489,6 +500,10 @@ def aggregate_shopify_orders(
     day_col = shopify_map.get('order_date')
     total_col = shopify_map.get('order_value')
     net_col = shopify_map.get('net_sales')
+    # Gulf's "Sales overview" export only (Sep 2026, per Mahmoud): a real
+    # Shipping charges column, summed the same safe way as Total sales/Net
+    # sales (padding rows are always 0) -- see FIELD_LABELS['shipping_charges'].
+    ship_col = shopify_map.get('shipping_charges')
     # Gulf's "Sales overview" export only: one row per (order, day) across the
     # WHOLE report date range, all zeros/blank except the day something
     # actually happened -- this column is populated only on that real row.
@@ -508,6 +523,8 @@ def aggregate_shopify_orders(
     work['_total_num'] = pd.to_numeric(work[total_col], errors='coerce').fillna(0) if total_col else 0.0
     if net_col:
         work['_net_num'] = pd.to_numeric(work[net_col], errors='coerce').fillna(0)
+    if ship_col:
+        work['_ship_num'] = pd.to_numeric(work[ship_col], errors='coerce').fillna(0)
     work['_day_parsed'] = work[day_col].map(lambda v: parse_date_cell(v, date_convention)) if day_col else None
     if event_col:
         # notna() first -- astype(str) alone turns an actual blank/NaN cell
@@ -548,6 +565,7 @@ def aggregate_shopify_orders(
             '_order_date': first['_day_parsed'],
             '_order_value': grp['_total_num'].sum(),
             '_net_sales': grp['_net_num'].sum() if net_col else None,
+            '_shipping_charges': grp['_ship_num'].sum() if ship_col else None,
             '_row_count': real_row_count,
             '_date_uncertain': date_uncertain,
         }
@@ -677,15 +695,22 @@ def merge_sources(
                     # Total sales INCLUDES shipping (subtotal + taxes + fees +
                     # shipping + reversals, per Shopify's own definition) --
                     # once Shipping is broken out as its own column, Value
-                    # should be the goods-only amount (Net sales), or
-                    # Value + Shipping would double-count the shipping fee.
-                    # Falls back to Total sales when no Net sales column was
-                    # mapped at all (nothing to split it with) -- which is
-                    # ALWAYS the case for Gulf (its Sales overview format has
-                    # no Net sales column at all, see TARGET_SHEETS['gulf']),
-                    # so this always resolves to plain Total sales for Gulf.
-                    # UAE & Oman uses 'uae_vat' below instead (VAT add-back).
-                    val = orow['_net_sales'] if orow['_net_sales'] is not None else orow['_order_value']
+                    # should be the goods-only amount, or Value + Shipping
+                    # would double-count the shipping fee. Priority (Sep
+                    # 2026, per Mahmoud): Gulf's own 'Shipping charges' column
+                    # when mapped (Total sales minus it, exact -- see 'zero'
+                    # below for the matching Shipping side), else Net sales
+                    # (when a Net sales column is mapped -- Iraq always has
+                    # one; Gulf's older "Sales overview" exports without a
+                    # Shipping charges column may or may not), else plain
+                    # Total sales. UAE & Oman uses 'uae_vat' below instead
+                    # (VAT add-back).
+                    if orow['_shipping_charges'] is not None:
+                        val = orow['_order_value'] - orow['_shipping_charges']
+                    elif orow['_net_sales'] is not None:
+                        val = orow['_net_sales']
+                    else:
+                        val = orow['_order_value']
                 elif field in ('new_customer', 'returning_customer'):
                     if TARGET_SHEETS[target_key].get('new_returning_combined'):
                         # Gulf's Shopify export has ONE text column ("New" /
@@ -732,12 +757,14 @@ def merge_sources(
                 else:
                     val = None
             elif source == 'zero':
-                # Gulf Shipping -- not split out at all, always written as 0
-                # (no reliable source to derive it from). Order Value now
-                # comes from Shopify's own Total sales instead (Sep 2026, see
-                # TARGET_SHEETS['gulf']'s 'fields' comment) -- this branch is
-                # unrelated to that and unchanged.
-                val = 0
+                # Gulf Shipping. Sep 2026 (per Mahmoud): when the Shopify
+                # export's own 'Shipping charges' column is mapped, use it
+                # as-is (paired with the matching Total-sales-minus-it
+                # subtraction for Order Value above, so Value + Shipping
+                # still equals Total sales exactly). Falls back to 0 when
+                # that column isn't mapped -- no other reliable source to
+                # derive it from (name kept as 'zero' for that fallback).
+                val = orow['_shipping_charges'] if (orow is not None and orow['_shipping_charges'] is not None) else 0
             elif source == 'month':
                 # "Sep 2026" style label derived from Order date (Sep 2026, per
                 # Mahmoud -- all 3 groups). Same _order_date the 'order_date' field
